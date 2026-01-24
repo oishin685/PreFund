@@ -13,7 +13,8 @@ import {
   ChevronUp,
   ChevronDown
 } from 'lucide-react';
-import { loadAppData, saveAppData, syncWithGoogleDrive } from './services/dataService';
+import { Share, Download, FolderInput, CheckCircle, AlertTriangle } from 'lucide-react';
+import { storageService } from './services/storageService';
 
 // --- 定数 ---
 const DEFAULT_START_DATE = '2025-12';
@@ -53,7 +54,8 @@ const parseCurrency = (val) => {
 
 // --- メインコンポーネント ---
 export default function App() {
-  // Sync Key Management (Internal)
+
+  // Sync Key Management (Legacy Support)
   const syncKey = useMemo(() => {
     let key = localStorage.getItem('prefund_user_key');
     if (!key) {
@@ -63,14 +65,21 @@ export default function App() {
     return key;
   }, []);
 
+  // Storage State
+  const [isStorageConnected, setIsStorageConnected] = useState(false);
+  const [storageName, setStorageName] = useState(null);
+
   // Local State
   const [accounts, setAccounts] = useState([]);
   const [items, setItems] = useState([]);
   // 口座の折りたたみ状態 (expanded by default)
   const [collapsedAccounts, setCollapsedAccounts] = useState({});
 
+
+
   const [isSaving, setIsSaving] = useState(false);
-  const [isDriveSyncing, setIsDriveSyncing] = useState(false);
+
+  // Removed isDriveSyncing
 
   const [modalType, setModalType] = useState(null);
   const [activeAccount, setActiveAccount] = useState(null);
@@ -83,18 +92,60 @@ export default function App() {
   const [showCategorySelector, setShowCategorySelector] = useState(false);
 
   // 初回データロード
+  // Initial Data Load
   useEffect(() => {
-    const { accounts: acc, items: itm } = loadAppData(syncKey);
-    // orderでの初期ソート（念のため）
-    const sortedAcc = [...acc].sort((a, b) => (a.order || 0) - (b.order || 0));
-    const sortedItm = [...itm].sort((a, b) => (a.order || 0) - (b.order || 0));
-    setAccounts(sortedAcc);
-    setItems(sortedItm);
+    const initApp = async () => {
+      // 1. Init Storage (Check IDB for handle)
+      const hasHandle = await storageService.init();
+      setIsStorageConnected(hasHandle);
+      if (hasHandle && storageService.directoryHandle) {
+        setStorageName(storageService.directoryHandle.name);
+      }
+
+      // 2. Load Data
+      // storageService.load() will try File -> Backup -> Fallback LS ('prefund_user_data')
+      let data = await storageService.load();
+
+      // 3. Legacy Migration (if empty, try loading old key format)
+      if ((!data.accounts || data.accounts.length === 0) && (!data.items || data.items.length === 0)) {
+        console.log('Checking legacy data...');
+        try {
+          const oldAcc = localStorage.getItem(`prefund_${syncKey}_accounts`);
+          const oldItm = localStorage.getItem(`prefund_${syncKey}_items`);
+          if (oldAcc || oldItm) {
+            data = {
+              accounts: oldAcc ? JSON.parse(oldAcc) : [],
+              items: oldItm ? JSON.parse(oldItm) : []
+            };
+            // Save to new system immediately to complete migration
+            storageService.save(data);
+          }
+        } catch (e) {
+          console.error('Legacy migration failed', e);
+        }
+      }
+
+      if (data.accounts) {
+        setAccounts(data.accounts.sort((a, b) => (a.order || 0) - (b.order || 0)));
+      }
+      if (data.items) {
+        setItems(data.items.sort((a, b) => (a.order || 0) - (b.order || 0)));
+      }
+    };
+    initApp();
   }, [syncKey]);
 
   // データ変更時に保存
+  // データ変更時に保存
   const saveData = (newAccounts, newItems) => {
-    saveAppData(syncKey, { accounts: newAccounts, items: newItems });
+    const data = { accounts: newAccounts, items: newItems };
+    storageService.save(data).catch(err => {
+      if (err.name === 'NotAllowedError') {
+        alert('保存に失敗しました: 権限が必要です。右上の「保存先」ボタンを押して権限を再取得してください。');
+      } else {
+        console.error(err);
+      }
+    });
     setAccounts(newAccounts);
     setItems(newItems);
   };
@@ -190,17 +241,31 @@ export default function App() {
     }
   };
 
-  const handleDriveSync = async () => {
-    setIsDriveSyncing(true);
-    const result = await syncWithGoogleDrive(syncKey, { accounts, items });
-    if (result) {
-      // Sync returns merged data. Ensure it's sorted.
-      const sAccounts = result.accounts.sort((a, b) => (a.order || 0) - (b.order || 0));
-      const sItems = result.items.sort((a, b) => (a.order || 0) - (b.order || 0));
-      setAccounts(sAccounts);
-      setItems(sItems);
+  const handleStorageSetup = async () => {
+    const currentData = { accounts, items };
+    const result = await storageService.setupStorage(currentData);
+    if (result.success) {
+      setIsStorageConnected(true);
+      setStorageName(result.name);
+      alert('保存先フォルダを設定しました。\n現在のデータが保存されました。');
+    } else {
+      // Canceled or failed
     }
-    setIsDriveSyncing(false);
+  };
+
+  const handleExport = async () => {
+    await storageService.exportData({ accounts, items });
+  };
+
+  const handleImport = async () => {
+    if (!confirm('現在のデータを上書きしてインポートしますか？')) return;
+    const data = await storageService.importData();
+    if (data && data.accounts) {
+      setAccounts(data.accounts);
+      setItems(data.items || []);
+      storageService.save(data);
+      alert('インポートしました');
+    }
   };
 
   // Monthly CSV Upload Handler (Sumishin SBI Bank Format - Shift-JIS)
@@ -341,7 +406,7 @@ export default function App() {
             if (interval <= 0) break; // intervalなしなら1回で終了
             const prevUseRaw = addMonths(item.useMonth, interval * (k - 1));
             currentUseMonth = addMonths(item.useMonth, interval * k);
-            currentStartMonth = prevUseRaw; // 支出したその月から次回の積立開始
+            currentStartMonth = addMonths(prevUseRaw, 1); // 支出した「翌月」から次回の積立開始
           }
 
           const totalM = getMonthDiff(currentStartMonth, currentUseMonth);
@@ -356,19 +421,27 @@ export default function App() {
 
             // 積立額計算
             if (totalM > 0) {
-              const perM = (item.targetAmount - itemInitial) / totalM;
+              // 支払い前月までに完了させるため、積立期間は totalM - 1 ヶ月とする
+              const savingMonths = totalM - 1;
+              const perM = savingMonths > 0 ? Math.ceil((item.targetAmount - itemInitial) / savingMonths) : (item.targetAmount - itemInitial);
+
+              // 支払い当月(currentUseMonth)は積み立てない
               if (m < currentUseMonth && m >= currentStartMonth) saving = perM;
 
               if (m < currentStartMonth) {
                 accumulated = 0;
               } else if (m < currentUseMonth) {
-                accumulated = itemInitial + (perM * (passedM + 1));
+                // 切り上げにより目標額を超える可能性があるため、Math.minでキャップをかける
+                accumulated = Math.min(item.targetAmount, itemInitial + (perM * (passedM + 1)));
+              } else if (m === currentUseMonth) {
+                // 支出月は、一旦0リセット（支出反映）
+                accumulated = 0;
               } else {
-                // m >= currentUseMonth (After spending, keep the target amount as accumulated history)
-                accumulated = item.targetAmount;
+                accumulated = 0;
               }
             } else if (totalM === 0 && m >= currentUseMonth) {
-              accumulated = item.targetAmount;
+              // 0ヶ月積立（即時使用）の場合
+              accumulated = 0;
             }
 
             // 支出判定
@@ -421,8 +494,8 @@ export default function App() {
           // CSVデータがあればそれを正とする（リセット）
           currentActual = csvVal;
         } else {
-          // CSVがなければ、前月残高 + 今月の積立 - 今月の支出
-          currentActual += (accData.required - accData.spending);
+          // CSVがなければ、前月残高をそのまま引き継ぐ（シミュレーション上で勝手に増やさない）
+          // currentActual = currentActual;
         }
 
         accData.balance = currentActual;
@@ -466,14 +539,30 @@ export default function App() {
             <p className="text-[11px] text-white/80 font-bold tracking-widest mt-0.5">PRE-FUND SIMULATOR</p>
           </div>
         </div>
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-2">
           <div className={`flex items-center gap-1.5 text-[10px] font-black uppercase px-4 py-2 rounded-full border-2 transition-all ${isSaving ? 'border-white text-white bg-white/20' : 'border-white/50 text-white/70 bg-transparent'}`}>
-            {isSaving ? <RefreshCw className="animate-spin" size={12} /> : <Cloud size={12} />}
+            {isSaving ? <RefreshCw className="animate-spin" size={12} /> : <CheckCircle size={12} />}
             {isSaving ? '保存中...' : '保存完了'}
           </div>
-          <button onClick={handleDriveSync} disabled={isDriveSyncing} className="flex items-center gap-2 bg-white text-[#E65100] hover:bg-[#FFF8E1] border-2 border-white px-5 py-2.5 rounded-lg font-black text-xs transition-all shadow-md hover:shadow-lg active:scale-95 disabled:opacity-50 disabled:active:scale-100">
-            {isDriveSyncing ? <RefreshCw className="animate-spin" size={14} /> : <HardDrive size={14} />}
-            同期する
+
+          {/* Storage Setup Button */}
+          <button
+            onClick={handleStorageSetup}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg font-black text-xs transition-all shadow-md active:scale-95 border-2 ${isStorageConnected
+              ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100'
+              : 'bg-white text-[#E65100] border-white hover:bg-[#FFF8E1]'
+              }`}
+          >
+            {isStorageConnected ? <CheckCircle size={14} /> : <AlertTriangle size={14} />}
+            {isStorageConnected ? `保存先: ${storageName || 'Folder'}` : 'フォルダ未連携 (Local)'}
+          </button>
+
+          {/* Export/Import Menu (Simple) */}
+          <button onClick={handleExport} className="p-2 text-white/70 hover:text-white bg-white/10 hover:bg-white/20 rounded-lg" title="エクスポート">
+            <Download size={16} />
+          </button>
+          <button onClick={handleImport} className="p-2 text-white/70 hover:text-white bg-white/10 hover:bg-white/20 rounded-lg" title="インポート">
+            <FolderInput size={16} />
           </button>
         </div>
       </header>

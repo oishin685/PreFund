@@ -131,14 +131,17 @@ export default function App() {
       if (data.items) {
         setItems(data.items.sort((a, b) => (a.order || 0) - (b.order || 0)));
       }
+      if (data.categoryBalances) {
+        setCategoryBalances(data.categoryBalances);
+      }
     };
     initApp();
   }, [syncKey]);
 
   // データ変更時に保存
   // データ変更時に保存
-  const saveData = (newAccounts, newItems) => {
-    const data = { accounts: newAccounts, items: newItems };
+  const saveData = (newAccounts, newItems, newCategoryBalances = categoryBalances) => {
+    const data = { accounts: newAccounts, items: newItems, categoryBalances: newCategoryBalances };
     storageService.save(data).catch(err => {
       if (err.name === 'NotAllowedError') {
         alert('保存に失敗しました: 権限が必要です。右上の「保存先」ボタンを押して権限を再取得してください。');
@@ -148,6 +151,7 @@ export default function App() {
     });
     setAccounts(newAccounts);
     setItems(newItems);
+    setCategoryBalances(newCategoryBalances);
   };
 
   // DB 操作の代替
@@ -160,6 +164,10 @@ export default function App() {
       let newAccounts;
       if (isDelete) {
         newAccounts = accounts.filter(a => a.id !== data.id);
+        // Also cleanup category balances
+        const newCatBalances = { ...categoryBalances };
+        delete newCatBalances[data.id];
+        saveData(newAccounts, items, newCatBalances);
       } else {
         const index = accounts.findIndex(a => a.id === data.id);
         if (index >= 0) {
@@ -254,7 +262,7 @@ export default function App() {
   };
 
   const handleExport = async () => {
-    await storageService.exportData({ accounts, items });
+    await storageService.exportData({ accounts, items, categoryBalances });
   };
 
   const handleImport = async () => {
@@ -263,6 +271,7 @@ export default function App() {
     if (data && data.accounts) {
       setAccounts(data.accounts);
       setItems(data.items || []);
+      setCategoryBalances(data.categoryBalances || {});
       storageService.save(data);
       alert('インポートしました');
     }
@@ -343,13 +352,15 @@ export default function App() {
   const applyCategoryBalance = (accountId) => {
     if (!csvUploadMonth || csvUploadData === null) return;
 
-    setCategoryBalances(prev => ({
-      ...prev,
+    const newBalances = {
+      ...categoryBalances,
       [accountId]: {
-        ...(prev[accountId] || {}),
+        ...(categoryBalances[accountId] || {}),
         [csvUploadMonth]: csvUploadData
       }
-    }));
+    };
+
+    saveData(accounts, items, newBalances);
 
     setShowCategorySelector(false);
     setCsvUploadMonth(null);
@@ -710,6 +721,17 @@ export default function App() {
                               ¥{Math.round(accData.balance).toLocaleString()}
                             </span>
                           </div>
+
+                          {/* 2.5 Difference */}
+                          {(() => {
+                            const diff = accData.balance - accData.target;
+                            return (
+                              <div className={`flex justify-between items-center p-1.5 rounded border shadow-sm ${diff >= 0 ? 'bg-white text-emerald-700' : 'bg-white text-[#dc2626]'}`}>
+                                <span className="text-[9px] font-bold sans-serif text-black whitespace-nowrap">差額</span>
+                                <span className="text-sm font-black whitespace-nowrap">¥{Math.round(diff).toLocaleString()}</span>
+                              </div>
+                            );
+                          })()}
 
                           {/* 3. Required Saving */}
                           <div className="flex justify-between items-center px-1 border-t border-[#1A202C]/10 pt-1">

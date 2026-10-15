@@ -14,7 +14,7 @@ import {
   ChevronDown
 } from 'lucide-react';
 import { Share, Download, FolderInput, CheckCircle, AlertTriangle } from 'lucide-react';
-import { storageService } from './services/storageService';
+import { storageService, validateData } from './services/storageService';
 
 // --- 定数 ---
 const DEFAULT_START_DATE = '2025-12';
@@ -68,6 +68,13 @@ export default function App() {
   // Storage State
   const [isStorageConnected, setIsStorageConnected] = useState(false);
   const [storageName, setStorageName] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isDataReady, setIsDataReady] = useState(false);
+  const [storageBusy, setStorageBusy] = useState(false);
+  const [storageMessage, setStorageMessage] = useState('読み込み中…');
+  const [saveError, setSaveError] = useState(null);
+  const [restoreChoices, setRestoreChoices] = useState(null);
+  const [restoreCandidate, setRestoreCandidate] = useState(null);
 
   // Local State
   const [accounts, setAccounts] = useState([]);
@@ -91,75 +98,64 @@ export default function App() {
   const [csvUploadData, setCsvUploadData] = useState(null);
   const [showCategorySelector, setShowCategorySelector] = useState(false);
 
-  // 初回データロード
-  // Initial Data Load
+  const applyData = (data) => {
+    setAccounts([...data.accounts].sort((a, b) => (a.order || 0) - (b.order || 0)));
+    setItems([...data.items].sort((a, b) => (a.order || 0) - (b.order || 0)));
+    setCategoryBalances(data.categoryBalances || {});
+  };
+
   useEffect(() => {
+    let canceled = false;
     const initApp = async () => {
-      // 1. Init Storage (Check IDB for handle)
-      const hasHandle = await storageService.init();
-      setIsStorageConnected(hasHandle);
-      if (hasHandle && storageService.directoryHandle) {
-        setStorageName(storageService.directoryHandle.name);
-      }
-
-      // 2. Load Data
-      // storageService.load() will try File -> Backup -> Fallback LS ('prefund_user_data')
-      let data = await storageService.load();
-
-      // 3. Legacy Migration (if empty, try loading old key format)
-      if ((!data.accounts || data.accounts.length === 0) && (!data.items || data.items.length === 0)) {
-        console.log('Checking legacy data...');
-        try {
+      try {
+        await storageService.init();
+        let data = await storageService.load();
+        // Legacy browser data is read only; startup never writes to the folder.
+        if (!storageService.directoryHandle && !data.emptyConfirmed && data.accounts.length === 0 && data.items.length === 0) {
           const oldAcc = localStorage.getItem(`prefund_${syncKey}_accounts`);
           const oldItm = localStorage.getItem(`prefund_${syncKey}_items`);
           if (oldAcc || oldItm) {
-            data = {
-              accounts: oldAcc ? JSON.parse(oldAcc) : [],
-              items: oldItm ? JSON.parse(oldItm) : []
-            };
-            // Save to new system immediately to complete migration
-            storageService.save(data);
+            data = validateData({ accounts: oldAcc ? JSON.parse(oldAcc) : [], items: oldItm ? JSON.parse(oldItm) : [] });
           }
-        } catch (e) {
-          console.error('Legacy migration failed', e);
         }
-      }
-
-      if (data.accounts) {
-        setAccounts(data.accounts.sort((a, b) => (a.order || 0) - (b.order || 0)));
-      }
-      if (data.items) {
-        setItems(data.items.sort((a, b) => (a.order || 0) - (b.order || 0)));
-      }
-      if (data.categoryBalances) {
-        setCategoryBalances(data.categoryBalances);
-      }
+        const connected = await storageService.isConnected();
+        if (canceled) return;
+        applyData(data);
+        setIsDataReady(true);
+        setIsStorageConnected(connected);
+        setStorageName(storageService.directoryHandle?.name || null);
+        const loaded = storageService.lastLoad;
+        setStorageMessage(loaded.recovered
+          ? `正常なバックアップ「${loaded.source}」を読み込みました。ファイルへ戻すには「バックアップから復元」を選んでください。`
+          : connected ? '保存先のデータを読み込みました。' : 'フォルダを再連携すると、保存済みデータを先に読み込みます。');
+        if (storageService.lastWarning) setSaveError(storageService.lastWarning);
+      } catch (e) {
+        if (!canceled) { setSaveError(e.message); setStorageMessage('読み込みを停止しました。保存ファイルは変更していません。'); }
+      } finally { if (!canceled) setIsLoading(false); }
     };
     initApp();
+    return () => { canceled = true; };
   }, [syncKey]);
 
-  // データ変更時に保存
-  // データ変更時に保存
-  const saveData = (newAccounts, newItems, newCategoryBalances = categoryBalances) => {
-    const data = { accounts: newAccounts, items: newItems, categoryBalances: newCategoryBalances };
-    storageService.save(data).catch(err => {
-      if (err.name === 'NotAllowedError') {
-        alert('保存に失敗しました: 権限が必要です。右上の「保存先」ボタンを押して権限を再取得してください。');
-      } else {
-        console.error(err);
-      }
-    });
-    setAccounts(newAccounts);
-    setItems(newItems);
-    setCategoryBalances(newCategoryBalances);
+  const saveData = async (newAccounts, newItems, newCategoryBalances = categoryBalances, options = {}) => {
+    if (isLoading || storageBusy || !isDataReady) return false;
+    setIsSaving(true);
+    setSaveError(null);
+    try {
+      const result = await storageService.save({ accounts: newAccounts, items: newItems, categoryBalances: newCategoryBalances }, options);
+      applyData({ accounts: newAccounts, items: newItems, categoryBalances: newCategoryBalances });
+      if (result.warning) setSaveError(result.warning);
+      setStorageMessage(result.destination === 'folder' ? 'フォルダに保存しました。' : 'このブラウザ内に保存しました。フォルダは未連携です。');
+      return true;
+    } catch (e) {
+      setSaveError(e.message);
+      setIsStorageConnected(await storageService.isConnected().catch(() => false));
+      return false;
+    } finally { setIsSaving(false); }
   };
 
   // DB 操作の代替
   const handleSave = async (col, data, isDelete = false) => {
-    setIsSaving(true);
-    // Mimic API delay
-    await new Promise(r => setTimeout(r, 300));
-
     if (col === 'accounts') {
       let newAccounts;
       if (isDelete) {
@@ -167,7 +163,7 @@ export default function App() {
         // Also cleanup category balances
         const newCatBalances = { ...categoryBalances };
         delete newCatBalances[data.id];
-        saveData(newAccounts, items, newCatBalances);
+        return await saveData(newAccounts, items.filter(item => item.accountId !== data.id), newCatBalances, { confirmedClear: newAccounts.length === 0 });
       } else {
         const index = accounts.findIndex(a => a.id === data.id);
         if (index >= 0) {
@@ -179,7 +175,7 @@ export default function App() {
       }
       // orderでソート
       newAccounts.sort((a, b) => (a.order || 0) - (b.order || 0));
-      saveData(newAccounts, items);
+      return await saveData(newAccounts, items);
     } else if (col === 'items') {
       let newItems;
       if (isDelete) {
@@ -200,10 +196,9 @@ export default function App() {
       }
       // orderでソート
       newItems.sort((a, b) => (a.order || 0) - (b.order || 0));
-      saveData(accounts, newItems);
+      return await saveData(accounts, newItems);
     }
 
-    setIsSaving(false);
   };
 
   // 並べ替え（ソート）機能
@@ -250,31 +245,63 @@ export default function App() {
   };
 
   const handleStorageSetup = async () => {
-    const currentData = { accounts, items };
-    const result = await storageService.setupStorage(currentData);
-    if (result.success) {
-      setIsStorageConnected(true);
+    setStorageBusy(true);
+    setSaveError(null);
+    try {
+      const result = await storageService.setupStorage({ accounts, items, categoryBalances });
+      if (!result.success) { if (!result.canceled) setSaveError(result.error.message); return; }
+      applyData(result.data);
+      setIsDataReady(true);
+      if (storageService.lastWarning) setSaveError(storageService.lastWarning);
+      setIsStorageConnected(await storageService.isConnected());
       setStorageName(result.name);
-      alert('保存先フォルダを設定しました。\n現在のデータが保存されました。');
-    } else {
-      // Canceled or failed
-    }
+      setStorageMessage(result.recovered
+        ? `正常なバックアップ「${result.source}」を読み込みました。元ファイルへの復元は「バックアップから復元」で行えます。`
+        : result.source ? '保存先のデータを読み込みました。連携時の上書きは行いません。' : '新しいフォルダを連携しました。次の編集から保存します。');
+    } catch (e) { setSaveError(e.message); }
+    finally { setStorageBusy(false); }
   };
 
   const handleExport = async () => {
-    await storageService.exportData({ accounts, items, categoryBalances });
+    try { await storageService.exportData({ accounts, items, categoryBalances }); }
+    catch (e) { setSaveError(e.message); }
   };
 
   const handleImport = async () => {
-    if (!confirm('現在のデータを上書きしてインポートしますか？')) return;
-    const data = await storageService.importData();
-    if (data && data.accounts) {
-      setAccounts(data.accounts);
-      setItems(data.items || []);
-      setCategoryBalances(data.categoryBalances || {});
-      storageService.save(data);
-      alert('インポートしました');
-    }
+    setStorageBusy(true);
+    try {
+      const data = await storageService.importData();
+      if (data) setRestoreCandidate({ name: '選択したJSONファイル', data });
+    } catch (e) { setSaveError(e.message); }
+    finally { setStorageBusy(false); }
+  };
+
+  const handleRestore = async () => {
+    setStorageBusy(true);
+    setSaveError(null);
+    try { setRestoreChoices(await storageService.listBackups()); }
+    catch (e) { setSaveError(e.message + ' 別のJSONファイルは「インポート」から選べます。'); }
+    finally { setStorageBusy(false); }
+  };
+
+  const confirmRestore = async () => {
+    if (!restoreCandidate) return;
+    setStorageBusy(true);
+    setSaveError(null);
+    try {
+      const data = await storageService.restoreData(restoreCandidate.data);
+      applyData(data);
+      setIsDataReady(true);
+      if (storageService.lastWarning) setSaveError(storageService.lastWarning);
+      setIsStorageConnected(await storageService.isConnected());
+      setStorageName(storageService.directoryHandle?.name || null);
+      setStorageMessage(storageService.directoryHandle
+        ? 'バックアップから復元しました。復元前のファイルも別名で保管しています。'
+        : 'このブラウザ内に復元しました。フォルダへの保存には連携が必要です。');
+      setRestoreCandidate(null);
+      setRestoreChoices(null);
+    } catch (e) { setSaveError(e.message); }
+    finally { setStorageBusy(false); }
   };
 
   // Monthly CSV Upload Handler (Sumishin SBI Bank Format - Shift-JIS)
@@ -349,7 +376,7 @@ export default function App() {
   };
 
   // Apply selected category update
-  const applyCategoryBalance = (accountId) => {
+  const applyCategoryBalance = async (accountId) => {
     if (!csvUploadMonth || csvUploadData === null) return;
 
     const newBalances = {
@@ -360,7 +387,7 @@ export default function App() {
       }
     };
 
-    saveData(accounts, items, newBalances);
+    if (!await saveData(accounts, items, newBalances)) return;
 
     setShowCategorySelector(false);
     setCsvUploadMonth(null);
@@ -540,7 +567,7 @@ export default function App() {
     <div className="h-screen flex flex-col bg-[#FAF9F6] text-black overflow-hidden font-sans text-sm selection:bg-amber-100">
 
       {/* --- App Header --- */}
-      <header className="flex-none bg-[#E65100] text-white border-b border-[#E65100] px-8 py-4 flex items-center justify-between z-50 shadow-md">
+      <header className="flex-none bg-[#E65100] text-white border-b border-[#E65100] px-4 sm:px-8 py-4 flex flex-wrap gap-3 items-center justify-between z-50 shadow-md">
         <div className="flex items-center gap-4">
           <div className="bg-white/20 p-2.5 rounded-xl text-white shadow-inner">
             <TrendingUp size={22} />
@@ -550,14 +577,15 @@ export default function App() {
             <p className="text-[11px] text-white/80 font-bold tracking-widest mt-0.5">PRE-FUND SIMULATOR</p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <div className={`flex items-center gap-1.5 text-[10px] font-black uppercase px-4 py-2 rounded-full border-2 transition-all ${isSaving ? 'border-white text-white bg-white/20' : 'border-white/50 text-white/70 bg-transparent'}`}>
+        <div className="flex flex-wrap items-center gap-2">
+          <div role="status" className={`flex items-center gap-1.5 text-[10px] font-black uppercase px-4 py-2 rounded-full border-2 transition-all ${isSaving ? 'border-white text-white bg-white/20' : 'border-white/50 text-white/70 bg-transparent'}`}>
             {isSaving ? <RefreshCw className="animate-spin" size={12} /> : <CheckCircle size={12} />}
-            {isSaving ? '保存中...' : '保存完了'}
+            {isLoading ? '読み込み中…' : storageBusy ? '確認中…' : isSaving ? '保存中…' : saveError ? '要確認' : isStorageConnected ? 'フォルダ連携済み' : 'ブラウザ内のみ'}
           </div>
 
           {/* Storage Setup Button */}
           <button
+            disabled={isLoading || storageBusy || isSaving || Boolean(restoreCandidate)}
             onClick={handleStorageSetup}
             className={`flex items-center gap-2 px-4 py-2.5 rounded-lg font-black text-xs transition-all shadow-md active:scale-95 border-2 ${isStorageConnected
               ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100'
@@ -568,18 +596,48 @@ export default function App() {
             {isStorageConnected ? `保存先: ${storageName || 'Folder'}` : 'フォルダ未連携 (Local)'}
           </button>
 
+          <button disabled={isLoading || storageBusy || isSaving || Boolean(restoreCandidate)} onClick={handleRestore} className="px-3 py-2 rounded-lg bg-white text-[#E65100] font-bold text-xs disabled:opacity-50">
+            バックアップから復元
+          </button>
           {/* Export/Import Menu (Simple) */}
-          <button onClick={handleExport} className="p-2 text-white/70 hover:text-white bg-white/10 hover:bg-white/20 rounded-lg" title="エクスポート">
+          <button disabled={isLoading || storageBusy || isSaving || Boolean(restoreCandidate)} onClick={handleExport} className="p-2 text-white/70 hover:text-white bg-white/10 hover:bg-white/20 rounded-lg" title="エクスポート">
             <Download size={16} />
           </button>
-          <button onClick={handleImport} className="p-2 text-white/70 hover:text-white bg-white/10 hover:bg-white/20 rounded-lg" title="インポート">
+          <button disabled={isLoading || storageBusy || isSaving || Boolean(restoreCandidate)} onClick={handleImport} className="p-2 text-white/70 hover:text-white bg-white/10 hover:bg-white/20 rounded-lg" title="インポート">
             <FolderInput size={16} />
           </button>
         </div>
       </header>
 
+      <div className="flex-none px-4 py-2 bg-amber-50 text-amber-950 text-xs break-words" role="status">{storageMessage}</div>
+      {saveError && <div className="flex-none px-4 py-3 bg-red-50 text-red-800 text-sm" role="alert">{saveError}</div>}
+
+      {(restoreChoices !== null || restoreCandidate) && (
+        <div className="fixed inset-0 bg-black/50 z-[100] flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="restore-title">
+          <div className="bg-white rounded-2xl p-5 w-full max-w-lg max-h-[85vh] overflow-auto shadow-xl">
+            <h2 id="restore-title" className="text-xl font-bold mb-3">バックアップから復元</h2>
+            {saveError && <p role="alert" className="mb-3 p-3 bg-red-50 text-red-800 rounded-lg">{saveError}</p>}
+            {restoreCandidate ? <>
+              <p className="break-all mb-3">{restoreCandidate.name}</p>
+              <p className="mb-3">{restoreCandidate.data.accounts.length}口座・{restoreCandidate.data.items.length}項目を読み込みます。月別残高も復元します。</p>
+              <p className="text-sm mb-4">{storageService.directoryHandle ? '保存先のデータを置き換えます。復元前のファイルと復元元は、別名のバックアップとして残します。' : 'このブラウザ内のデータを置き換えます。復元前のデータもブラウザ内に残します。'}</p>
+              <button disabled={storageBusy} onClick={confirmRestore} className="bg-[#E65100] text-white rounded-lg px-4 py-3 font-bold disabled:opacity-50">{storageBusy ? '復元中…' : 'この内容で復元する'}</button>
+            </> : <>
+              <p className="text-sm mb-3">正常で空ではないバックアップを、新しい順に表示しています。</p>
+              {restoreChoices.length === 0 && <p className="mb-3">連携フォルダに使えるバックアップがありません。JSONファイルを選べます。</p>}
+              {restoreChoices.map(choice => <button key={choice.name} onClick={() => setRestoreCandidate(choice)} className="block w-full text-left border rounded-lg p-3 mb-2 hover:bg-amber-50">
+                <span className="block break-all font-bold">{choice.name}</span>
+                <span className="block text-xs">{new Date(choice.modified).toLocaleString('ja-JP')} · {choice.data.accounts.length}口座 · {choice.data.items.length}項目</span>
+              </button>)}
+              <button disabled={storageBusy} onClick={handleImport} className="bg-amber-100 rounded-lg px-4 py-3 font-bold">別のJSONファイルを選ぶ</button>
+            </>}
+            <button disabled={storageBusy} onClick={() => { setRestoreChoices(null); setRestoreCandidate(null); }} className="ml-3 mt-3 px-4 py-3 border rounded-lg">キャンセル</button>
+          </div>
+        </div>
+      )}
+
       {/* --- Main Sheet Area --- */}
-      <div className="flex-1 overflow-auto relative scroll-smooth bg-[#FAF9F6]">
+      <div inert={!isDataReady || isLoading || storageBusy || isSaving || restoreChoices !== null || restoreCandidate ? "" : undefined} className="flex-1 overflow-auto relative scroll-smooth bg-[#FAF9F6]">
         <table className="border-collapse table-fixed w-max min-w-full">
 
           {/* --- Table Header --- */}
@@ -857,11 +915,12 @@ export default function App() {
         <div className="fixed inset-0 bg-stone-900/40 backdrop-blur-sm z-[100] flex items-center justify-center p-6 animate-in text-left">
           <div className="bg-[#FAF9F6] rounded-[2rem] w-full max-w-sm p-8 shadow-2xl scale-in ring-1 ring-black/5">
             <h3 className="text-xl font-black text-slate-800 mb-6 font-serif tracking-tight">{modalType === 'account' ? '新しい口座を追加' : '口座設定'}</h3>
-            <form onSubmit={async (e) => {
+            {saveError && <p role="alert" className="mb-3 p-3 bg-red-50 text-red-800 rounded-lg">{saveError}</p>}
+            <form inert={isSaving || storageBusy ? "" : undefined} onSubmit={async (e) => {
               e.preventDefault(); const f = new FormData(e.target);
               const init = parseCurrency(f.get('initialBalance'));
-              await handleSave('accounts', { id: activeAccount?.id || `acc-${Date.now()}`, name: f.get('name'), startMonth: f.get('startMonth'), initialBalance: init, actualBalance: activeAccount ? (activeAccount.actualBalance || init) : init, order: activeAccount?.order || accounts.length });
-              setModalType(null); setActiveAccount(null);
+              const saved = await handleSave('accounts', { id: activeAccount?.id || `acc-${Date.now()}`, name: f.get('name'), startMonth: f.get('startMonth'), initialBalance: init, actualBalance: activeAccount ? (activeAccount.actualBalance || init) : init, order: activeAccount?.order || accounts.length });
+              if (saved) { setModalType(null); setActiveAccount(null); }
             }} className="space-y-5">
               <div>
                 <label className="block text-[10px] font-bold text-stone-400 uppercase mb-1.5 tracking-wider">口座名称</label>
@@ -878,7 +937,7 @@ export default function App() {
               <div className="flex flex-col gap-3 pt-2">
                 <button type="submit" className="w-full bg-slate-800 hover:bg-slate-700 text-white font-bold py-3.5 rounded-xl shadow-lg shadow-slate-900/20 active:scale-95 transition-all">保存する</button>
                 {modalType === 'editAccount' && (
-                  <button type="button" onClick={async () => { if (confirm('本当に削除しますか？')) await handleSave('accounts', activeAccount, true); setModalType(null); }} className="text-rose-500 font-bold text-xs py-2 hover:bg-rose-50 rounded-lg transition-colors">
+                  <button type="button" onClick={async () => { if (confirm('本当に削除しますか？')) { const saved = await handleSave('accounts', activeAccount, true); if (saved) setModalType(null); } }} className="text-rose-500 font-bold text-xs py-2 hover:bg-rose-50 rounded-lg transition-colors">
                     この口座を削除
                   </button>
                 )}
@@ -895,9 +954,10 @@ export default function App() {
         <div className="fixed inset-0 bg-stone-900/40 backdrop-blur-sm z-[100] flex items-center justify-center p-6 text-left">
           <div className="bg-[#FAF9F6] rounded-[2rem] w-full max-w-lg p-8 shadow-2xl overflow-y-auto max-h-[90vh] scale-in ring-1 ring-black/5">
             <h3 className="text-xl font-black text-slate-800 mb-6 font-serif tracking-tight">{activeItem ? '目的を編集' : '新しい目的を追加'}</h3>
-            <form className="space-y-5" onSubmit={async (e) => {
+            {saveError && <p role="alert" className="mb-3 p-3 bg-red-50 text-red-800 rounded-lg">{saveError}</p>}
+            <form inert={isSaving || storageBusy ? "" : undefined} className="space-y-5" onSubmit={async (e) => {
               e.preventDefault(); const f = new FormData(e.target);
-              await handleSave('items', {
+              const saved = await handleSave('items', {
                 id: activeItem?.id || `item-${Date.now()}`,
                 accountId: activeAccount?.id,
                 name: f.get('name'),
@@ -910,7 +970,7 @@ export default function App() {
                 status: 'active',
                 order: activeItem?.order
               });
-              setModalType(null); setActiveItem(null);
+              if (saved) { setModalType(null); setActiveItem(null); }
             }}>
               <div>
                 <label className="block text-[10px] font-bold text-stone-400 uppercase mb-1.5 tracking-wider">目的の名称</label>

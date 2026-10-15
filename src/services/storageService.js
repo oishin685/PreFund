@@ -1,262 +1,270 @@
-import { getDirectoryHandle, setDirectoryHandle, delDirectoryHandle } from './idbHelper';
+import { getDirectoryHandle, setDirectoryHandle, delDirectoryHandle } from './idbHelper.js';
 
 const FILE_NAME = 'data.json';
 const BACKUP_FILE_NAME = 'data.backup.json';
-const TEMP_FILE_NAME = 'data.tmp.json';
-const STORAGE_KEY_PREFIX = 'prefund_user_data'; // Fallback / Mirror
-
-// Helper: Serialize/Deserialize
+const STORAGE_KEY = 'prefund_user_data';
 const serialize = (data) => JSON.stringify(data, null, 2);
-const deserialize = (text) => JSON.parse(text);
+const emptyData = () => ({ accounts: [], items: [], categoryBalances: {} });
+const isRecord = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const error = (message) => new Error(message);
 
-/**
- * Storage Service
- * Manages data persistence via File System Access API (Primary) and LocalStorage (Fallback/Mirror).
- */
-export const storageService = {
-
-    directoryHandle: null,
-
-    /**
-     * Check if we have access to a directory.
-     * MUST be called on app start.
-     */
-    async init() {
-        try {
-            const handle = await getDirectoryHandle();
-            if (handle) {
-                // Verify permissions (read-only check usually passes, readwrite needs query)
-                // We just store it. effectively "verifying" it requires user gesture if not granted.
-                // We will try to use it. If it fails, we catch error and might need to ask user.
-                this.directoryHandle = handle;
-                return true;
-            }
-        } catch (e) {
-            console.warn('IDB init error:', e);
+export function validateData(data) {
+    if (!isRecord(data) || !Array.isArray(data.accounts) || !Array.isArray(data.items)) {
+        throw error('PreFund形式のデータではありません。口座・項目の配列が必要です。');
+    }
+    const ids = new Set();
+    for (const account of data.accounts) {
+        if (!isRecord(account) || typeof account.id !== 'string' || !account.id || ids.has(account.id) || typeof account.name !== 'string') {
+            throw error('口座の形式またはIDに問題があります。');
         }
-        return false;
-    },
-
-    /**
-     * Verify permission and request if needed.
-     * Chrome usually requires this on every reload for "edit" access unless persistent permissions are enabled (experimental).
-     */
-    async verifyPermission(mode = 'readwrite') {
-        if (!this.directoryHandle) return false;
-
-        // Check if permission is already granted
-        const options = { mode };
-        if ((await this.directoryHandle.queryPermission(options)) === 'granted') {
-            return true;
+        ids.add(account.id);
+    }
+    const itemIds = new Set();
+    for (const item of data.items) {
+        if (!isRecord(item) || typeof item.id !== 'string' || !item.id || itemIds.has(item.id) || !ids.has(item.accountId) || typeof item.name !== 'string') {
+            throw error('項目の形式または口座との対応に問題があります。');
         }
-
-        // Request permission (Requires user gesture!)
-        if ((await this.directoryHandle.requestPermission(options)) === 'granted') {
-            return true;
-        }
-
-        return false;
-    },
-
-    /**
-     * Setup Storage: User selects a folder.
-     * MIGRATION: Saves currentData immediately to the new folder.
-     */
-    async setupStorage(currentData) {
-        try {
-            const handle = await window.showDirectoryPicker({
-                id: 'prefund-documents',
-                mode: 'readwrite'
-            });
-
-            this.directoryHandle = handle;
-            await setDirectoryHandle(handle);
-
-            // Migration: Immediate Save
-            if (currentData) {
-                await this.save(currentData, true); // Force file write
-            }
-
-            return { success: true, name: handle.name };
-        } catch (e) {
-            console.error('Setup canceled or failed:', e);
-            return { success: false, error: e };
-        }
-    },
-
-    /**
-     * Disconnect Storage
-     */
-    async disconnect() {
-        this.directoryHandle = null;
-        await delDirectoryHandle();
-    },
-
-    /**
-     * Load Data
-     * Strategy: File (if handle) -> Backup File (if error) -> LocalStorage (Fallback)
-     */
-    async load() {
-        let data = null;
-
-        // 1. Try File System
-        if (this.directoryHandle) {
-            try {
-                // We try to verify permission. If we can't get it without gesture, this might fail on first load.
-                // Browsers implementing persistent permissions might allow this.
-                // If queryPermission is 'prompt', we can't show prompt here (needs gesture).
-                // So we might fall back to LS, but UI should show "Reconnect needed".
-
-                // For now, try reading.
-                const fileHandle = await this.directoryHandle.getFileHandle(FILE_NAME);
-                const file = await fileHandle.getFile();
-                const text = await file.text();
-                data = deserialize(text);
-
-            } catch (e) {
-                console.warn('File load failed (primary), trying backup...', e);
-                try {
-                    const fileHandle = await this.directoryHandle.getFileHandle(BACKUP_FILE_NAME);
-                    const file = await fileHandle.getFile();
-                    const text = await file.text();
-                    data = deserialize(text);
-                } catch (e2) {
-                    console.warn('File load failed (backup).', e2);
+        itemIds.add(item.id);
+    }
+    if (data.categoryBalances !== undefined) {
+        if (!isRecord(data.categoryBalances)) throw error('月別残高の形式に問題があります。');
+        for (const [id, months] of Object.entries(data.categoryBalances)) {
+            if (!ids.has(id) || !isRecord(months)) throw error('月別残高の口座との対応に問題があります。');
+            for (const [month, amount] of Object.entries(months)) {
+                if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month) || typeof amount !== 'number' || !Number.isFinite(amount)) {
+                    throw error('月別残高の月または金額に問題があります。');
                 }
             }
-        }
-
-        // 2. Fallback to LocalStorage
-        if (!data) {
-            console.log('Loading from LocalStorage fallback.');
-            const json = localStorage.getItem(STORAGE_KEY_PREFIX);
-            if (json) {
-                data = JSON.parse(json);
-            }
-        }
-
-        // Default empty structure
-        if (!data) {
-            data = { accounts: [], items: [] };
-        }
-
-        return data;
-    },
-
-    /**
-     * Save Data
-     * Strategy: LocalStorage (Always) + File (If handle exists)
-     */
-    async save(data, forceFile = false) {
-        // 1. Always mirror to LocalStorage for safety / fallback
-        localStorage.setItem(STORAGE_KEY_PREFIX, JSON.stringify(data));
-
-        // 2. Save to File if Handle exists
-        if (this.directoryHandle) {
-            try {
-                // Ensure permission (might need gesture if not persisted)
-                // If this is called from an event handler (button click), requestPermission works.
-                // If auto-save, it might fail if permission is 'prompt'.
-
-                // Atomic Write Flow
-                // a. Create/Write TMP
-                const tmpHandle = await this.directoryHandle.getFileHandle(TEMP_FILE_NAME, { create: true });
-                const writable = await tmpHandle.createWritable();
-                await writable.write(serialize(data));
-                await writable.close();
-
-                // b. Backup Current (if exists)
-                try {
-                    const currentHandle = await this.directoryHandle.getFileHandle(FILE_NAME);
-                    const currentFile = await currentHandle.getFile();
-                    // Read content to copy to backup
-                    // Optimized: Just write current data to backup? 
-                    // Better: Rename current to backup? (No easy rename in API yet)
-                    // Simple: Write 'data' to backup as well? No, backup should be 'previous' state ideally.
-                    // For simplicity & robustness: Write current in-memory data to backup BEFORE overwriting main?
-                    // No, logic: 
-                    // 1. Write Data to Tmp.
-                    // 2. Copy 'Main' to 'Backup' (if Main exists).
-                    // 3. Move 'Tmp' to 'Main'.
-
-                    // Implementation of Step 2 (Copy Main to Backup)
-                    try {
-                        // Read current main
-                        const oldDataText = await currentFile.text();
-                        // Write to backup
-                        const backupHandle = await this.directoryHandle.getFileHandle(BACKUP_FILE_NAME, { create: true });
-                        const backupWx = await backupHandle.createWritable();
-                        await backupWx.write(oldDataText);
-                        await backupWx.close();
-                    } catch (e) {
-                        // Main might not exist yet
-                    }
-
-                } catch (e) {
-                    // Main doesn't exist, skip backup
-                }
-
-                // c. Overwrite Main with Tmp content
-                // Since we can't easily "move", we write data to Main.
-                // actually we can just write data to Main assuming Tmp succeeded.
-                // The tmp file was a check to see if we CAN write.
-
-                const mainHandle = await this.directoryHandle.getFileHandle(FILE_NAME, { create: true });
-                const mainWx = await mainHandle.createWritable();
-                await mainWx.write(serialize(data));
-                await mainWx.close();
-
-                // Cleanup Tmp
-                await this.directoryHandle.removeEntry(TEMP_FILE_NAME, { recursive: false }).catch(() => { });
-
-            } catch (e) {
-                console.error('File save failed:', e);
-                // If permission Error, we might need to notify user.
-                // For now, allow fallback to handle it silently (data is in localStorage)
-                throw e; // Propagate to let UI show error if needed
-            }
-        }
-    },
-
-    /**
-     * Export JSON
-     */
-    async exportData(data) {
-        try {
-            const handle = await window.showSaveFilePicker({
-                suggestedName: `prefund_backup_${new Date().toISOString().slice(0, 10)}.json`,
-                types: [{
-                    description: 'JSON Data',
-                    accept: { 'application/json': ['.json'] },
-                }],
-            });
-            const writable = await handle.createWritable();
-            await writable.write(serialize(data));
-            await writable.close();
-            return true;
-        } catch (e) {
-            console.error('Export canceled/failed', e);
-            return false;
-        }
-    },
-
-    /**
-     * Import JSON
-     */
-    async importData() {
-        try {
-            const [handle] = await window.showOpenFilePicker({
-                types: [{
-                    description: 'JSON Data',
-                    accept: { 'application/json': ['.json'] },
-                }],
-            });
-            const file = await handle.getFile();
-            const text = await file.text();
-            return deserialize(text);
-        } catch (e) {
-            console.error('Import canceled/failed', e);
-            return null;
         }
     }
-};
+    return { ...data, categoryBalances: data.categoryBalances || {} };
+}
+
+export const hasData = (data) => data.accounts.length > 0 || data.items.length > 0;
+const parse = (text) => validateData(JSON.parse(text));
+const backupName = (name) => name === BACKUP_FILE_NAME || /^data\.(backup[.-]|before-|recovery-source-|snapshot-).*\.json$/.test(name) || /^prefund_backup_.*\.json$/.test(name);
+
+async function readFile(handle, name) {
+    try {
+        const file = await (await handle.getFileHandle(name)).getFile();
+        return { name, text: await file.text(), modified: file.lastModified };
+    } catch (e) {
+        if (e.name === 'NotFoundError') return null;
+        throw e; // Permission and I/O failures must never be interpreted as an empty folder.
+    }
+}
+
+async function backups(handle) {
+    const found = [];
+    for await (const [name, entry] of handle.entries()) {
+        if (entry.kind !== 'file' || !backupName(name)) continue;
+        const file = await readFile(handle, name);
+        if (!file) continue;
+        try {
+            const data = parse(file.text);
+            if (hasData(data)) found.push({ ...file, data });
+        } catch { /* A damaged backup is skipped; it is never overwritten or deleted. */ }
+    }
+    return found.sort((a, b) => b.modified - a.modified || a.name.localeCompare(b.name));
+}
+
+async function inspectFolder(handle) {
+    const primary = await readFile(handle, FILE_NAME);
+    if (primary) {
+        try {
+            const data = parse(primary.text);
+            if (hasData(data) || data.emptyConfirmed === true) return { data, source: FILE_NAME, recovered: false };
+        } catch { /* Search intact backups before offering recovery. */ }
+    }
+    const candidates = await backups(handle);
+    if (candidates.length) return { data: candidates[0].data, source: candidates[0].name, recovered: true };
+    // Existing empty/corrupt JSON requires explicit recovery, never migration into that folder.
+    let hasExisting = Boolean(primary);
+    for await (const [name, entry] of handle.entries()) {
+        if (entry.kind === 'file' && backupName(name)) hasExisting = true;
+    }
+    if (hasExisting) throw error('保存データが空または破損していて、正常なバックアップが見つかりません。別のバックアップを選んで復元してください。');
+    return { data: null, source: null, recovered: false };
+}
+
+async function writeFile(handle, name, text, create = true) {
+    const file = await handle.getFileHandle(name, { create });
+    const writable = await file.createWritable();
+    try {
+        await writable.write(text);
+        await writable.close();
+    } catch (e) {
+        await writable.abort().catch(() => {});
+        throw e;
+    }
+    const saved = await (await file.getFile()).text();
+    if (saved !== text) throw error('保存後の内容が一致しません。操作を中止しました。');
+}
+
+// Operations are serialized so an older save cannot finish after a restore or reconnect.
+export function createStorageService() {
+    let queue = Promise.resolve();
+    const exclusive = (operation) => {
+        const result = queue.then(operation);
+        queue = result.catch(() => {});
+        return result;
+    };
+    let sequence = 0;
+    const snapshot = async (handle, text) => {
+        // Check for collisions across reloads/tabs. Never intentionally reuse a snapshot name.
+        let name;
+        do {
+            name = `data.snapshot-${new Date().toISOString().replace(/[:.]/g, '-')}-${sequence++}.json`;
+        } while (await readFile(handle, name));
+        await writeFile(handle, name, text);
+        return name;
+    };
+    const service = {
+        directoryHandle: null,
+        ready: false,
+        lastLoad: { source: null, recovered: false },
+        lastWarning: null,
+        mirror(text) {
+            try { localStorage.setItem(STORAGE_KEY, text); }
+            catch { this.lastWarning = 'フォルダへの保存・読み込みは完了しましたが、ブラウザ内の控えを更新できませんでした。'; }
+        },
+        async init() {
+            this.ready = false;
+            try { this.directoryHandle = await getDirectoryHandle(); }
+            catch { this.directoryHandle = null; }
+            return Boolean(this.directoryHandle);
+        },
+        async isConnected() {
+            return this.ready && Boolean(this.directoryHandle) && await this.directoryHandle.queryPermission({ mode: 'readwrite' }) === 'granted';
+        },
+        async setupStorage(currentData) {
+            // Picker must run in the original user gesture, before any async queue work.
+            let handle;
+            try { handle = await window.showDirectoryPicker({ id: 'prefund-documents', mode: 'readwrite' }); }
+            catch (e) { return { success: false, canceled: e.name === 'AbortError', error: e }; }
+            return exclusive(async () => {
+                try {
+                    this.lastWarning = null;
+                    const result = await inspectFolder(handle);
+                    const data = result.data || validateData(currentData);
+                    // Preserve nonempty on-screen data when switching to a different existing dataset.
+                    // This backup is local to this browser and is never uploaded.
+                    if (hasData(validateData(currentData)) && serialize(validateData(currentData)) !== serialize(data)) {
+                        localStorage.setItem('prefund_before_reconnect', serialize(validateData(currentData)));
+                    }
+                    await setDirectoryHandle(handle);
+                    this.directoryHandle = handle;
+                    this.ready = true;
+                    this.lastLoad = result;
+                    this.mirror(serialize(data));
+                    return { success: true, name: handle.name, ...result, data };
+                } catch (e) { return { success: false, error: e }; }
+            });
+        },
+        async disconnect() {
+            return exclusive(async () => { this.ready = false; this.directoryHandle = null; await delDirectoryHandle(); });
+        },
+        async load() {
+            return exclusive(async () => {
+                this.ready = false;
+                this.lastWarning = null;
+                this.lastLoad = { source: 'local', recovered: false };
+                if (this.directoryHandle) {
+                    // No permission prompt during startup. Reconnect is an explicit button action.
+                    if (await this.directoryHandle.queryPermission({ mode: 'read' }) === 'granted') {
+                        const result = await inspectFolder(this.directoryHandle);
+                        this.ready = await this.directoryHandle.queryPermission({ mode: 'readwrite' }) === 'granted';
+                        this.lastLoad = result;
+                        if (result.data) {
+                            this.mirror(serialize(result.data));
+                            return result.data;
+                        }
+                    }
+                }
+                const text = localStorage.getItem(STORAGE_KEY);
+                return text ? parse(text) : emptyData();
+            });
+        },
+        async save(input, { confirmedClear = false } = {}) {
+            const data = validateData(input);
+            if (!hasData(data) && !confirmedClear) throw error('空データの保存を停止しました。バックアップから復元してください。');
+            if (!hasData(data) && confirmedClear) data.emptyConfirmed = true;
+            else delete data.emptyConfirmed;
+            const text = serialize(data); // Freeze payload before entering the queue.
+            return exclusive(async () => {
+                this.lastWarning = null;
+                if (this.directoryHandle) {
+                    if (!await this.isConnected()) throw error('フォルダを再連携して、保存済みデータを読み込んでください。');
+                    const old = await readFile(this.directoryHandle, FILE_NAME);
+                    if (old && old.text !== text) {
+                        await snapshot(this.directoryHandle, old.text);
+                        let previous = null;
+                        try { previous = parse(old.text); } catch { /* Keep corrupt original in its snapshot only. */ }
+                        if (previous && hasData(previous)) await writeFile(this.directoryHandle, BACKUP_FILE_NAME, old.text);
+                    }
+                    if (!old || old.text !== text) await writeFile(this.directoryHandle, FILE_NAME, text);
+                }
+                if (this.directoryHandle) this.mirror(text);
+                else localStorage.setItem(STORAGE_KEY, text);
+                return { warning: this.lastWarning, destination: this.directoryHandle ? 'folder' : 'local' };
+            });
+        },
+        async listBackups() {
+            return exclusive(async () => {
+                if (!this.directoryHandle) return [];
+                const candidates = await backups(this.directoryHandle);
+                return candidates.map(({ name, modified, data }) => ({ name, modified, data }));
+            });
+        },
+        async restoreData(input) {
+            const data = validateData(input);
+            if (!hasData(data)) throw error('空のバックアップからは復元できません。');
+            const text = serialize(data);
+            return exclusive(async () => {
+                this.lastWarning = null;
+                // Preserve browser data before touching it. For folder recovery the disk snapshots
+                // remain authoritative even if browser storage is unavailable.
+                try {
+                    const previous = localStorage.getItem(STORAGE_KEY);
+                    if (previous) localStorage.setItem('prefund_before_restore', previous);
+                } catch (e) {
+                    if (!this.directoryHandle) throw e;
+                    this.lastWarning = 'ブラウザ内の控えを保管できませんでした。復元前のファイルはフォルダ内に保管します。';
+                }
+                if (this.directoryHandle) {
+                    // Called from the user's restore confirmation; permission may have expired.
+                    if (await this.directoryHandle.queryPermission({ mode: 'readwrite' }) !== 'granted' && await this.directoryHandle.requestPermission({ mode: 'readwrite' }) !== 'granted') {
+                        throw error('復元には保存先フォルダへの書き込み許可が必要です。');
+                    }
+                    const old = await readFile(this.directoryHandle, FILE_NAME);
+                    if (old) await snapshot(this.directoryHandle, old.text);
+                    await snapshot(this.directoryHandle, text); // Keep the recovery source independently.
+                    await writeFile(this.directoryHandle, FILE_NAME, text);
+                    this.ready = true;
+                }
+                if (this.directoryHandle) this.mirror(text);
+                else localStorage.setItem(STORAGE_KEY, text);
+                return data;
+            });
+        },
+        async exportData(data) {
+            try {
+                const valid = validateData(data);
+                const handle = await window.showSaveFilePicker({ suggestedName: `prefund_backup_${new Date().toISOString().slice(0, 10)}.json`, types: [{ description: 'JSON Data', accept: { 'application/json': ['.json'] } }] });
+                const writable = await handle.createWritable();
+                await writable.write(serialize(valid));
+                await writable.close();
+                return true;
+            } catch (e) { if (e.name !== 'AbortError') throw e; return false; }
+        },
+        async importData() {
+            try {
+                const [handle] = await window.showOpenFilePicker({ types: [{ description: 'PreFund バックアップ', accept: { 'application/json': ['.json'] } }] });
+                return parse(await (await handle.getFile()).text());
+            } catch (e) { if (e.name !== 'AbortError') throw e; return null; }
+        }
+    };
+    return service;
+}
+
+export const storageService = createStorageService();
